@@ -689,7 +689,7 @@ def render_sequence(models, json_path, output_dir, utm_zone=33,
                     save_normals=True,
                     random_sun=False, sun_seed=None,
                     low_light=False, high_bright=False,
-                    exposure=1.0):
+                    exposure=1.0, save_rgb=True, depth_format='npz'):
     """
     Render trajectory to a sequence of frames."""
     if background_color is None:
@@ -710,19 +710,23 @@ def render_sequence(models, json_path, output_dir, utm_zone=33,
 
     # 1. Setup Renderer
     render = None
-    render_failed = False
-    try:
-        render = rendering.OffscreenRenderer(width, height)
-        render.scene.set_background(background_color)
-    except Exception as e:
-        print(f"Warning: Open3D OffscreenRenderer failed: {e}")
-        print(f"         This usually means no GPU/EGL is available (headless node).")
-        if save_depth:
-            print(f"         Falling back to DEPTH-ONLY mode via raycasting (no RGB rendering).")
-            render_failed = True
-        else:
-            print(f"         Skipping rendering entirely (no depth requested either).")
-            return
+    render_failed = not save_rgb
+    if save_rgb:
+        try:
+            render = rendering.OffscreenRenderer(width, height)
+            render.scene.set_background(background_color)
+        except Exception as e:
+            print(f"Warning: Open3D OffscreenRenderer failed: {e}")
+            print(f"         This usually means no GPU/EGL is available (headless node).")
+            if save_depth:
+                print(f"         Falling back to DEPTH-ONLY mode via raycasting (no RGB rendering).")
+                render_failed = True
+            else:
+                print(f"         Skipping rendering entirely (no depth requested either).")
+                return
+    elif not save_depth:
+        print("Skipping: neither RGB nor depth was requested.")
+        return
     
     enable_realism = high_quality or realism
     enable_lighting = high_quality or lighting or realism
@@ -953,8 +957,17 @@ def render_sequence(models, json_path, output_dir, utm_zone=33,
             hit_mask = ~np.isinf(t_hit)
             t_hit[~hit_mask] = 0
             
-            depth_path = depth_dir / f"depth_{i:04d}.npz"
-            np.savez(depth_path, depth=t_hit.astype(np.float32))
+            if depth_format == 'png16':
+                depth_max=float(t_hit[hit_mask].max()) if hit_mask.any() else 1.
+                encoded=np.zeros(t_hit.shape,dtype=np.uint16)
+                encoded[hit_mask]=np.clip(np.rint(t_hit[hit_mask]/depth_max*65535),1,65535).astype(np.uint16)
+                depth_path=depth_dir/f"depth_{i:04d}.png"
+                if not cv2.imwrite(str(depth_path),encoded): raise IOError(f'Failed to save {depth_path}')
+                depth_path.with_suffix('.json').write_text(json.dumps({'depth_min_m':0.0,'depth_max_m':depth_max}))
+            elif depth_format == 'npz':
+                np.savez(depth_dir/f"depth_{i:04d}.npz",depth=t_hit.astype(np.float32))
+            else:
+                raise ValueError(f'Unknown depth format: {depth_format}')
             
             # Save surface normals to separate folder
             if save_normals:
