@@ -7,6 +7,17 @@ from scipy.spatial.transform import Rotation
 
 
 def make_poses(positions, cfg):
+    target=cfg['trajectory'].get('look_at_point')
+    if target is not None:
+        forward=np.asarray(target,dtype=float)-positions
+        forward/=np.maximum(np.linalg.norm(forward,axis=1)[:,None],1e-9)
+        up=np.broadcast_to([0.,0.,1.],forward.shape).copy()
+        up[np.abs(forward[:,2])>.999]=[0.,1.,0.]
+        right=np.cross(forward,up)
+        right/=np.maximum(np.linalg.norm(right,axis=1)[:,None],1e-9)
+        down=np.cross(forward,right)
+        down/=np.maximum(np.linalg.norm(down,axis=1)[:,None],1e-9)
+        return np.stack((right,down,forward),axis=2)
     u = np.linspace(0,1,len(positions))
     tilt = np.deg2rad(cfg['trajectory']['tilt_from_nadir_deg']
                      + cfg['trajectory']['tilt_variation_deg']*np.sin(4*np.pi*u))

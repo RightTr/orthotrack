@@ -76,12 +76,61 @@ def fit_map_scale(route_xy,hit_xy,center,allowed,margin):
     hi=footprint.max(axis=(0,1))+margin
     span=path.max(0)-path.min(0)
     scale=min(1.,float(np.min((allowed[2:]-allowed[:2]-(hi-lo))/np.maximum(span,1e-6))))
-    if scale<=0: raise ValueError('Camera footprint alone is larger than the available DOP')
+    if scale<=0: raise ValueError(f'Camera footprint alone is larger than available DOP: required={hi-lo}, available={allowed[2:]-allowed[:2]}')
     center_lo=allowed[:2]-scale*path.min(0)-lo
     center_hi=allowed[2:]-scale*path.max(0)-hi
     if np.any(center_lo>center_hi+1e-5): raise ValueError('No feasible route center inside DOP bounds')
     center_hi=np.maximum(center_hi,center_lo)
     return scale,np.clip(center,center_lo,center_hi)
+
+
+def fill_dop_route(route, bounds, ratio=.9):
+    """Spread route centers across a fixed DOP; camera footprints may extend beyond its edge."""
+    target=bounds[:2]+(1-ratio)*(bounds[2:]-bounds[:2])/2
+    target_size=ratio*(bounds[2:]-bounds[:2])
+    route[:,:2]=target+(route[:,:2]-route[:,:2].min(0))*target_size/(route[:,:2].max(0)-route[:,:2].min(0))
+    return route
+
+
+def dop_view_overlap(hits,bounds):
+    rect=np.array([[bounds[0],bounds[1]],[bounds[2],bounds[1]],
+                   [bounds[2],bounds[3]],[bounds[0],bounds[3]]],np.float32)
+    ratios=[]
+    for rays in hits:
+        footprint=cv2.convexHull(rays[[0,2,8,6]].astype(np.float32))
+        area=cv2.contourArea(footprint)
+        intersection,_=cv2.intersectConvexConvex(footprint,rect)
+        ratios.append(float(intersection/max(area,1e-6)))
+    ratios=np.asarray(ratios)
+    return {'mean':float(ratios.mean()),'p10':float(np.quantile(ratios,.1)),
+            'minimum':float(ratios.min())}
+
+
+def fit_fov_to_dop(local,rot,floor,cfg,dsm,dsm_bounds,dop_bounds,margin=2.):
+    original=float(cfg['sequence']['fov_vertical_deg'])
+
+    def project(fov):
+        cfg['sequence']['fov_vertical_deg']=float(fov)
+        hits=frustum_hits(local,rot,floor,cfg,dsm,dsm_bounds)
+        corners=hits[:,[0,2,8,6]]
+        inside=((corners[:,:,0]>=dop_bounds[0]+margin)&(corners[:,:,0]<=dop_bounds[2]-margin)&
+                (corners[:,:,1]>=dop_bounds[1]+margin)&(corners[:,:,1]<=dop_bounds[3]-margin))
+        return bool(inside.all()),hits
+
+    fits,hits=project(original)
+    if fits:
+        return hits
+    low,high=2.,original
+    fits,_=project(low)
+    if not fits:
+        raise ValueError('DOP is too small to contain the camera view, even at 2 degree FOV')
+    for _ in range(12):
+        mid=(low+high)/2
+        fits,_=project(mid)
+        if fits: low=mid
+        else: high=mid
+    cfg['sequence']['fov_vertical_deg']=low*.995
+    return frustum_hits(local,rot,floor,cfg,dsm,dsm_bounds)
 
 
 def lift_route(route,dsm,bounds,offset,cfg):
@@ -136,6 +185,7 @@ def reference_parameters(ref,dsm,bounds):
 
 
 def prepare(cfg, scene, frames):
+    scene.parent.mkdir(parents=True,exist_ok=True)
     ref=Path(cfg['map']['reference_scene']); meta=json.loads((ref/'meta.json').read_text())
     if cfg['map']['vertical_offset_m'] is None:
         raise ValueError('Vertical datum unverified: set map.vertical_offset_m explicitly after DSM/mesh datum calibration')
@@ -163,17 +213,28 @@ def prepare(cfg, scene, frames):
         center_delta=rng.uniform(-ratio,ratio,2)*(allowed[2:]-allowed[:2])
         placement={'seed':seed,'randomized':bool(ratio),'offset_xy_m':center_delta.tolist()}
         atomic_json(placement_path,placement)
+    if cfg['map'].get('fill_dop_trajectory',False): center_delta=np.zeros(2)
     center=offset[:2]+mid+center_delta
     terrain=dsm_heights(dsm,bounds,(center-offset[:2])[None])[0]
+    if cfg['trajectory'].get('look_at_map_center',False):
+        cfg['trajectory']['look_at_point']=[float(center[0]),float(center[1]),
+                                             float(terrain+offset[2]+cfg['map']['vertical_offset_m'])]
     base_passes=cfg['trajectory']['passes']
     cfg['trajectory']['passes_override']=base_passes
     base=make_route(cfg,center,terrain+offset[2]+cfg['map']['vertical_offset_m'],allowed)
+    fill=cfg['map'].get('fill_dop_trajectory',False)
+    world_allowed=safe_allowed+np.tile(offset[:2],2)
+    if fill: fill_dop_route(base,world_allowed,cfg['map'].get('trajectory_coverage_ratio',.9))
     lift_route(base,dsm,bounds,offset,cfg)
     base_rot=make_poses(base,cfg)
     base_hits=frustum_hits(base-offset,base_rot,floor,cfg,dsm,bounds)
-    scale,center_fit=fit_map_scale(base[:,:2]-offset[:2],base_hits,center-offset[:2],safe_allowed,cfg['map']['margin_m'])
-    estimate=base.copy()
-    estimate[:,:2]=offset[:2]+center_fit+scale*(base[:,:2]-center)
+    if fill:
+        estimate=base.copy()
+        scale=1.
+    else:
+        scale,center_fit=fit_map_scale(base[:,:2]-offset[:2],base_hits,center-offset[:2],safe_allowed,cfg['map']['margin_m'])
+        estimate=base.copy()
+        estimate[:,:2]=offset[:2]+center_fit+scale*(base[:,:2]-center)
     estimate_roof=dsm_heights(dsm,bounds,estimate[:,:2]-offset[:2])+offset[2]
     estimate[:,2]+=max(0.,float(np.max(estimate_roof+cfg['trajectory']['safe_distance_m']+.25-estimate[:,2])),
                         float(cfg['trajectory']['min_agl_m']-np.min(estimate[:,2]-estimate_roof)))
@@ -183,19 +244,25 @@ def prepare(cfg, scene, frames):
     if required>maximum: raise ValueError(f'DOP-limited route needs {required} passes, maximum is {maximum}')
     cfg['trajectory']['passes_override']=required
     base=make_route(cfg,center,terrain+offset[2]+cfg['map']['vertical_offset_m'],allowed)
+    if fill: fill_dop_route(base,world_allowed,cfg['map'].get('trajectory_coverage_ratio',.9))
     lift_route(base,dsm,bounds,offset,cfg)
     base_rot=make_poses(base,cfg)
     hits=frustum_hits(base-offset,base_rot,floor,cfg,dsm,bounds)
-    coverage_scale,center_fit=fit_map_scale(base[:,:2]-offset[:2],hits,center-offset[:2],safe_allowed,cfg['map']['margin_m'])
-    planned=base.copy()
-    planned[:,:2]=offset[:2]+center_fit+coverage_scale*(base[:,:2]-center)
+    if fill:
+        coverage_scale=1.
+        center_fit=(safe_allowed[:2]+safe_allowed[2:])/2
+        planned=base.copy()
+    else:
+        coverage_scale,center_fit=fit_map_scale(base[:,:2]-offset[:2],hits,center-offset[:2],safe_allowed,cfg['map']['margin_m'])
+        planned=base.copy()
+        planned[:,:2]=offset[:2]+center_fit+coverage_scale*(base[:,:2]-center)
     roof,lift=lift_route(planned,dsm,bounds,offset,cfg)
     planned_rot=make_poses(planned,cfg)
     local_hits=frustum_hits(planned-offset,planned_rot,floor,cfg,dsm,bounds)
     points=local_hits.reshape(-1,2)
     full_bbox=np.r_[points.min(0)-cfg['map']['margin_m'],points.max(0)+cfg['map']['margin_m']]
     shift_lo,shift_hi=safe_allowed[:2]-full_bbox[:2],safe_allowed[2:]-full_bbox[2:]
-    if np.any(shift_lo>shift_hi+1e-5):
+    if np.any(shift_lo>shift_hi+1e-5) and not fill:
         current_xy=planned[:,:2]-offset[:2]
         coverage_scale,center_fit=fit_map_scale(current_xy,local_hits,center_fit,safe_allowed,cfg['map']['margin_m'])
         planned[:,:2]=offset[:2]+center_fit+coverage_scale*(current_xy-center_fit)
@@ -205,8 +272,8 @@ def prepare(cfg, scene, frames):
         points=frustum_hits(planned-offset,planned_rot,floor,cfg,dsm,bounds).reshape(-1,2)
         full_bbox=np.r_[points.min(0)-cfg['map']['margin_m'],points.max(0)+cfg['map']['margin_m']]
         shift_lo,shift_hi=safe_allowed[:2]-full_bbox[:2],safe_allowed[2:]-full_bbox[2:]
-    if np.any(shift_lo>shift_hi+1e-5): raise ValueError(f'Camera footprint exceeds DOP: {full_bbox}, available {allowed}')
-    shift=np.clip(np.zeros(2),shift_lo,np.maximum(shift_hi,shift_lo))
+    if np.any(shift_lo>shift_hi+1e-5) and not fill: raise ValueError(f'Camera footprint exceeds DOP: {full_bbox}, available {allowed}')
+    shift=np.zeros(2) if fill else np.clip(np.zeros(2),shift_lo,np.maximum(shift_hi,shift_lo))
     planned[:,:2]+=shift
     center_fit+=shift
     roof,extra_lift=lift_route(planned,dsm,bounds,offset,cfg)
@@ -214,8 +281,10 @@ def prepare(cfg, scene, frames):
     if lift>cfg['trajectory']['max_auto_lift_m']: raise ValueError(f'DSM requires {lift:.2f} m lift, above max_auto_lift_m')
     planned_rot=make_poses(planned,cfg)
     bbox=frustum_bbox(planned-offset,planned_rot,floor,cfg,dsm,bounds)
-    if np.any(bbox[:2]<allowed[:2]-1e-4) or np.any(bbox[2:]>allowed[2:]+1e-4):
+    if (np.any(bbox[:2]<allowed[:2]-1e-4) or np.any(bbox[2:]>allowed[2:]+1e-4)) and not fill:
         raise ValueError(f'Planned frustum exceeds DOP after direct fit: {bbox}, available {allowed}')
+    if cfg['map'].get('preserve_dop_bounds',False):
+        bbox=db.copy()
     center_delta=center_fit-mid
     placement.update(offset_xy_m=center_delta.tolist(),randomized=bool(np.linalg.norm(center_delta)>0.01))
     atomic_json(placement_path,placement)
@@ -231,6 +300,9 @@ def prepare(cfg, scene, frames):
         raise ValueError('Auto route has insufficient height/scale variation')
     pos=planned[:frames];rot=planned_rot[:frames]
     cfg['sequence']['frames']=frames
+    local=pos-offset
+    if cfg['trajectory'].get('fit_fov_to_dop',False):
+        fit_fov_to_dop(local,rot,floor,cfg,dsm,bounds,db)
     scene.mkdir(parents=True,exist_ok=True)
     doc=export_ges(scene/'trajectory.json',pos,rot,cfg)
     loader=PoseLoader(str(scene/'trajectory.json'),utm_zone=cfg['map']['utm_zone'])
@@ -239,7 +311,10 @@ def prepare(cfg, scene, frames):
     for i in np.linspace(0,frames-1,min(frames,50),dtype=int):
         if Rotation.from_matrix(loader.poses[i].rotation_matrix @ rot[i].T).magnitude()>1e-5:
             raise ValueError(f'PoseLoader orientation round-trip failed at frame {i}')
-    local=pos-offset
+    view_overlap=dop_view_overlap(frustum_hits(local,rot,floor,cfg,dsm,bounds),db)
+    minimum_overlap=cfg['trajectory'].get('min_dop_view_overlap',.98)
+    if view_overlap['p10']<minimum_overlap:
+        raise ValueError(f'Camera/DOP overlap too low: p10={view_overlap["p10"]:.3f}, required={minimum_overlap:.3f}')
     # The collision mesh and DSM in the reference scene use the same utm_offset-local frame.
     visibility=mesh_visibility(local,rot,cfg,ref/'mesh.npz')
     atomic_json(scene/'mesh_visibility.json',visibility)
@@ -253,10 +328,13 @@ def prepare(cfg, scene, frames):
     image=cv2.imread(str(ref/dop_info['file']))
     if image is None: raise FileNotFoundError(ref/dop_info['file'])
     H,W=image.shape[:2]
-    x0=int(np.floor((bbox[0]-db[0])/(db[2]-db[0])*W)); x1=int(np.ceil((bbox[2]-db[0])/(db[2]-db[0])*W))
-    y0=int(np.floor((db[3]-bbox[3])/(db[3]-db[1])*H)); y1=int(np.ceil((db[3]-bbox[1])/(db[3]-db[1])*H))
-    if min(x0,y0)<0 or x1>W or y1>H: raise ValueError('DOP crop exceeds reference image')
-    crop=image[y0:y1,x0:x1]
+    if cfg['map'].get('preserve_dop_bounds',False):
+        bbox=db.copy(); crop=image
+    else:
+        x0=int(np.floor((bbox[0]-db[0])/(db[2]-db[0])*W)); x1=int(np.ceil((bbox[2]-db[0])/(db[2]-db[0])*W))
+        y0=int(np.floor((db[3]-bbox[3])/(db[3]-db[1])*H)); y1=int(np.ceil((db[3]-bbox[1])/(db[3]-db[1])*H))
+        if min(x0,y0)<0 or x1>W or y1>H: raise ValueError('DOP crop exceeds reference image')
+        crop=image[y0:y1,x0:x1]
     factor=max(1,int(np.ceil(max(crop.shape[:2])/cfg['map']['max_dop_size'])))
     if factor>1: crop=cv2.resize(crop,(int(np.ceil(crop.shape[1]/factor)),int(np.ceil(crop.shape[0]/factor))),interpolation=cv2.INTER_AREA)
     (scene/'dop').mkdir(exist_ok=True); cv2.imwrite(str(scene/'dop'/f'{cfg["map"]["dop_year"]}.jpg'),crop)
@@ -270,7 +348,8 @@ def prepare(cfg, scene, frames):
     preview=scene/'preview';preview.mkdir(exist_ok=True)
     agl=local[:,2]-dsm_heights(dsm,bounds,local[:,:2])
     distance=float(np.linalg.norm(np.diff(local,axis=0),axis=1).sum())
-    atomic_json(scene/'plan_report.json',challenge_report(cfg,local,rot,agl,float(coverage_scale)))
+    report=challenge_report(cfg,local,rot,agl,float(coverage_scale));report['dop_view_overlap']=view_overlap
+    atomic_json(scene/'plan_report.json',report)
     atomic_json(scene/'config_used.json',cfg)
     fig,ax=plt.subplots(figsize=(7,7))
     ax.imshow(cv2.cvtColor(crop,cv2.COLOR_BGR2RGB),extent=bbox[[0,2,1,3]],origin='upper')
@@ -656,6 +735,8 @@ def main():
         plan=json.loads((scene/'plan_report.json').read_text())
         if plan['frames']!=n or plan['agl_min_m']<cfg['trajectory']['min_agl_m']-.1 or plan['agl_max_m']>cfg['trajectory']['max_agl_m']+.1:
             raise ValueError('Plan report violates frame or AGL constraints')
+        if cfg['trajectory'].get('look_at_map_center',False) and plan.get('dop_view_overlap',{}).get('p10',0)<cfg['trajectory'].get('min_dop_view_overlap',.98):
+            raise ValueError('Camera/DOP view overlap is below the configured minimum')
         if n==cfg['sequence']['frames'] and (plan['distance_m']<cfg['trajectory']['min_distance_m'] or (cfg['trajectory']['height_variation_ratio']>0 and plan['scale_ratio']<cfg['trajectory']['min_scale_ratio'])):
             raise ValueError('Plan report violates distance or scale constraints')
         depth=scene/'depth';pngs=sorted(depth.glob('depth_*.png')) if depth.exists() else []
