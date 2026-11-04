@@ -7,29 +7,32 @@ from scipy.spatial.transform import Rotation
 
 
 def make_poses(positions, cfg):
-    target=cfg['trajectory'].get('look_at_point')
-    if target is not None:
-        forward=np.asarray(target,dtype=float)-positions
-        forward/=np.maximum(np.linalg.norm(forward,axis=1)[:,None],1e-9)
-        up=np.broadcast_to([0.,0.,1.],forward.shape).copy()
-        up[np.abs(forward[:,2])>.999]=[0.,1.,0.]
-        right=np.cross(forward,up)
-        right/=np.maximum(np.linalg.norm(right,axis=1)[:,None],1e-9)
-        down=np.cross(forward,right)
-        down/=np.maximum(np.linalg.norm(down,axis=1)[:,None],1e-9)
-        return np.stack((right,down,forward),axis=2)
-    u = np.linspace(0,1,len(positions))
-    tilt = np.deg2rad(cfg['trajectory']['tilt_from_nadir_deg']
-                     + cfg['trajectory']['tilt_variation_deg']*np.sin(4*np.pi*u))
-    velocity = np.gradient(positions, axis=0)
-    tangent = velocity.copy(); tangent[:,2] = 0
-    tangent /= np.maximum(np.linalg.norm(tangent, axis=1)[:,None], 1e-9)
-    side = np.deg2rad(cfg['trajectory']['side_look_deg'])*np.sin(6*np.pi*u)
-    heading = np.arctan2(tangent[:,1],tangent[:,0])+side
-    tangent[:,0],tangent[:,1] = np.cos(heading),np.sin(heading)
-    forward = np.column_stack((tangent[:,0]*np.sin(tilt), tangent[:,1]*np.sin(tilt), -np.cos(tilt)))
-    right = np.cross(forward, np.array([0.,0.,1.])); right /= np.linalg.norm(right,axis=1)[:,None]
-    down = np.cross(forward,right)
+    return make_forward_poses(positions, cfg)
+
+
+def make_forward_poses(positions, cfg):
+    plan=cfg['trajectory']
+    arc=np.r_[0,np.cumsum(np.linalg.norm(np.diff(positions[:,:2],axis=0),axis=1))]
+    look=float(plan['heading_lookahead_m'])
+    if look <= 0: raise ValueError('heading_lookahead_m must be positive')
+    ahead=np.minimum(arc+look,arc[-1]); behind=np.maximum(arc-look,0)
+    front=np.column_stack([np.interp(ahead,arc,positions[:,j]) for j in range(2)])
+    back=np.column_stack([np.interp(behind,arc,positions[:,j]) for j in range(2)])
+    direction=front-positions[:,:2]
+    terminal=np.linalg.norm(direction,axis=1)<1e-8
+    direction[terminal]=positions[terminal,:2]-back[terminal]
+    heading=np.unwrap(np.arctan2(direction[:,1],direction[:,0]))
+    side=np.deg2rad(plan['side_look_deg'])*np.sin(2*np.pi*arc/max(arc[-1],1))
+    heading+=side
+    fov=float(cfg['sequence']['fov_vertical_deg'])
+    max_tilt=90-fov/2-1
+    tilt=plan['tilt_from_nadir_deg']+plan['tilt_variation_deg']*np.sin(2*np.pi*arc/max(arc[-1],1))
+    if np.any(tilt<=0) or np.any(tilt>=max_tilt):
+        raise ValueError(f'Camera tilt must be between 0 and {max_tilt:.1f} degrees for this FOV')
+    tilt=np.deg2rad(tilt)
+    forward=np.column_stack((np.cos(heading)*np.sin(tilt),np.sin(heading)*np.sin(tilt),-np.cos(tilt)))
+    right=np.cross(forward,[0.,0.,1.]);right/=np.linalg.norm(right,axis=1)[:,None]
+    down=np.cross(forward,right)
     return np.stack((right,down,forward),axis=2)
 
 

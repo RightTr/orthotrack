@@ -1,36 +1,40 @@
-sequence: {frames: 10000, fps: 15, width: 960, height: 540}
+sequence:
+  frames: 3000
+  fps: 15
+  width: 960
+  height: 540
+  samples: 1
+
 trajectory:
-  route_shape: curved
-  passes: 5
-  route_span_x_ratio: 0.27
-  route_span_y_ratio: 0.26
   seed: 42
-  random_center_ratio: 0.15
-  height_offset_ratio: 0.0
-  height_variation_ratio: 0.25
-  tilt_from_nadir_deg: 24
-  tilt_variation_deg: 8
-  side_look_deg: 12
-  max_speed_mps: 7.0
-  safe_distance_m: 3
-  min_agl_m: 100
-  max_agl_ratio: 6.0
-  min_distance_m: 1000
-  min_scale_ratio: 1.5
-  max_auto_lift_m: 200
-ablations:
-  baseline: {}
-  height_low: {height_offset_ratio: -0.10}
-  height_high: {height_offset_ratio: 0.10}
-  height_fixed: {height_variation_ratio: 0.0}
-  path_straight: {route_shape: straight}
-  path_crossing: {route_shape: crossing}
+  coverage_ratio: 0.88
+  edge_margin_ratio: 0.06
+  cruise_speed_mps: 10.0
+  turn_speed_mps: 5.0
+  max_speed_mps: 15.0
+  height_agl_m: 120.0
+  height_variation_m: 20.0
+  height_wavelength_m: 500.0
+  tilt_from_nadir_deg: 42.0
+  tilt_variation_deg: 3.0
+  side_look_deg: 2.0
+  heading_lookahead_m: 35.0
+  safe_distance_m: 3.0
+
 map:
-  reference_scene: /mnt/Data/RIght/MovingDrone_Long/olympiastadion1/reference
+  reference_scene: /home/right/orthotrack/outputs/reference
   utm_zone: 33
   vertical_offset_m: 0.0
   dop_year: 2023
-  max_dop_size: 2048
-  margin_m: 30
-render: {chunk_frames: 2000}
-output_root: /mnt/Data/RIght/MovingDrone_Long
+  crop_width_px: 2000
+  crop_height_px: 1600
+  random_crop: true
+  render_margin_ratio: 0.15
+  render_margin_m: 30.0
+
+render:
+  backend: cpu
+  chunk_frames: 2000
+  save_depth: true
+
+output_root: /home/right/orthotrack/outputs

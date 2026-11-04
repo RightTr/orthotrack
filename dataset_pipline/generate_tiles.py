@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 import yaml
 from tqdm import tqdm
-from collision import dsm_heights
 
 ROOT=Path(__file__).resolve().parents[1]
 DATA=Path('/mnt/Data/RIght/MovingDrone_Long')
@@ -27,18 +26,6 @@ def csv_rows(path):
     import csv
     with path.open() as f:
         return list(csv.DictReader(f))
-
-
-def reference_heights(source, ref):
-    rows=csv_rows(source/'baseline/poses.csv')
-    xyz=np.asarray([[float(row[k]) for k in ('x','y','z')] for row in rows])
-    with np.load(ref/'dsm.npz') as data:
-        ground=dsm_heights(data['height'],data['bounds'],xyz[:,:2])
-    agl=xyz[:,2]-ground
-    agl=agl[np.isfinite(agl)&(ground>-9000)&(agl>0)]
-    if len(agl)<30:
-        raise ValueError(f'Not enough valid Long baseline AGL samples: {source}')
-    return np.quantile(agl,[.05,.5,.95])
 
 
 def sample_rect(rng,w,h,tw,th,used):
@@ -120,51 +107,39 @@ def main():
         cfg=json.loads(json.dumps(cfg0))
         cfg['output_root']=str(OUT/source.name)
         cfg['sequence'].update(name=name,frames=a.frames)
+        cfg['sequence']['samples']=1
         cfg['map'].update(reference_scene=str(map_ref),dop_year=year,
-                          preserve_dop_bounds=True,fill_dop_trajectory=True,
-                          trajectory_coverage_ratio=.9,margin_m=8,
-                          fixed_dop_size_m=[bounds[2]-bounds[0],bounds[3]-bounds[1]])
-        low_agl,ref_agl,high_agl=reference_heights(source,ref)
-        height_amplitude=float((high_agl-low_agl)/2.4)
+                          scene_name=name,crop_width_px=tw,crop_height_px=th,
+                          random_crop=False)
         ref_fov=float(np.median([float(r['fov_vertical']) for r in csv_rows(ref/'poses.csv')]))
         cfg['sequence']['fov_vertical_deg']=ref_fov
         traj_seed=int.from_bytes(hashlib.sha256(f'{name}:{seed}:trajectory'.encode()).digest()[:4],'little')
-        cfg['trajectory'].update(height_offset_ratio=0.,height_variation_ratio=float(height_amplitude/ref_agl),
-                                 min_agl_m=float(low_agl),reference_agl_m=float(ref_agl),
-                                 height_agl_m=float(ref_agl),height_variation_m=float(height_amplitude),
-                                 look_at_map_center=True,fit_fov_to_dop=True,min_dop_view_overlap=.98,
-                                 seed=traj_seed,passes=2,max_speed_mps=12.,
-                                 min_distance_m=float(min(400.,.8*((bounds[2]-bounds[0])+(bounds[3]-bounds[1])))),
-                                 min_scale_ratio=1.35,max_auto_passes=30,random_center_ratio=0.)
+        cfg['trajectory']['seed']=traj_seed
 
-        scene=OUT/source.name/name/'baseline'
+        scene=OUT/source.name/f'{name}_crop0001'/'baseline'
         used_cfg=scene/'config_used.json'
         matches=False
         if used_cfg.is_file():
             used=json.loads(used_cfg.read_text())
             matches=(used['sequence']['frames']==a.frames
-                     and used['trajectory']['min_agl_m']==cfg['trajectory']['min_agl_m']
-                     and used['trajectory']['height_agl_m']==float(ref_agl)
-                     and used['trajectory'].get('look_at_map_center') is True
-                     and used['trajectory'].get('fit_fov_to_dop') is True
-                     and used['trajectory']['seed']==traj_seed)
+                     and used['map']['crop_width_px']==tw
+                     and used['map']['crop_height_px']==th)
         state['jobs'][name]={'status':'running','seed':seed,'trajectory_seed':traj_seed,
-                             'x0':x0,'y0':y0,'dop_size_m':cfg['map']['fixed_dop_size_m'],
+                             'x0':x0,'y0':y0,'dop_size_m':[bounds[2]-bounds[0],bounds[3]-bounds[1]],
                              'source':source.name,'scene':str(scene)}
         save_json(state_path,state)
         config_path=OUT/'configs'/f'{name}.yaml'
         config_path.parent.mkdir(parents=True,exist_ok=True)
         config_path.write_text(yaml.safe_dump(cfg,sort_keys=False))
-        print(f'[{job_index}/{len(jobs)}] {name}: fixed DOP {tw}x{th}px, {a.frames} frames, Long AGL p05/50/95={low_agl:.0f}/{ref_agl:.0f}/{high_agl:.0f}m',flush=True)
+        print(f'[{job_index}/{len(jobs)}] {name}: fixed DOP {tw}x{th}px, {a.frames} frames',flush=True)
         if matches and (scene/'video.mp4').is_file() and (scene/'poses.csv').is_file():
             state['jobs'][name]['status']='done'
             save_json(state_path,state)
             continue
         try:
-            subprocess.run([sys.executable,'dataset_pipline/pipeline.py','generate','--config',str(config_path),
-                            '--variant','baseline','--keep-variant-name'],cwd=ROOT,check=True)
+            subprocess.run([sys.executable,'dataset_pipline/pipeline.py','generate','--config',str(config_path)],cwd=ROOT,check=True)
             subprocess.run([sys.executable,'dataset_pipline/pipeline.py','validate','--config',str(config_path),
-                            '--variant','baseline','--keep-variant-name'],cwd=ROOT,check=True)
+                            ],cwd=ROOT,check=True)
             state['jobs'][name]['status']='done'
         except subprocess.CalledProcessError as e:
             state['jobs'][name]['status']='failed'
