@@ -162,7 +162,36 @@ def prepare_manual(cfg, scene, assets):
     return doc
 
 
-def render_gpu(cfg,scene,doc,assets,save_depth=False):
+def render_first_frame_gpu(cfg,scene,doc,assets):
+    import open3d as o3d
+    from open3d.visualization import rendering
+    offset=np.asarray(assets.meta['utm_offset'],np.float32)
+    vertices,faces=assets.mesh();dop,image=assets.dop(cfg['map']['dop_year'],render=True)
+    bounds=np.asarray(dop['bounds'],float)
+    mesh=o3d.geometry.TriangleMesh();mesh.vertices=o3d.utility.Vector3dVector(vertices)
+    mesh.triangles=o3d.utility.Vector3iVector(faces.astype(np.int32))
+    tri_xy=vertices[faces.reshape(-1),:2]
+    mesh.triangle_uvs=o3d.utility.Vector2dVector(np.column_stack(((tri_xy[:,0]-bounds[0])/(bounds[2]-bounds[0]),
+                                                                  (tri_xy[:,1]-bounds[1])/(bounds[3]-bounds[1]))))
+    material=rendering.MaterialRecord();material.shader='defaultUnlit'
+    material.albedo_img=o3d.geometry.Image(cv2.cvtColor(image,cv2.COLOR_BGR2RGB))
+    renderer=rendering.OffscreenRenderer(cfg['sequence']['width'],cfg['sequence']['height'])
+    renderer.scene.set_background([0.53,0.78,0.92,1.]);renderer.scene.add_geometry('city',mesh,material)
+    renderer.scene.camera.set_projection(cfg['sequence']['fov_vertical_deg'],
+        cfg['sequence']['width']/float(cfg['sequence']['height']),.1,100000.,rendering.Camera.FovType.Vertical)
+    pose=PoseLoader(str(scene/'trajectory.json'),utm_zone=cfg['map']['utm_zone']).get_pose(0)
+    position=(pose.position-offset).astype(np.float32);rotation=pose.rotation_matrix
+    forward=rotation@np.array([0.,0.,1.]);up=rotation@np.array([0.,-1.,0.])
+    up-=np.dot(up,forward)*forward;up/=np.linalg.norm(up)
+    renderer.scene.camera.look_at(position+forward*10000.,position,up)
+    frame=np.asarray(renderer.render_to_image())
+    path=scene/'preview'/'first_frame_rgb.png'
+    if not cv2.imwrite(str(path),cv2.cvtColor(frame,cv2.COLOR_RGB2BGR)):
+        raise IOError(f'Cannot save first-frame preview: {path}')
+    return path
+
+
+def render_gpu(cfg,scene,doc,assets,save_depth=False,save_rgb=True):
     """Render the DOP-textured mesh and optional depth with Open3D's GPU renderer."""
     import open3d as o3d
     from open3d.visualization import rendering
@@ -188,8 +217,8 @@ def render_gpu(cfg,scene,doc,assets,save_depth=False):
     loader=PoseLoader(str(scene/'trajectory.json'),utm_zone=cfg['map']['utm_zone'])
     n=len(doc['cameraFrames']);fps=cfg['sequence']['fps'];depth_dir=scene/'depth'
     video=scene/'video.mp4';partial=scene/'video.partial.mp4'
-    writer=cv2.VideoWriter(str(partial),cv2.VideoWriter_fourcc(*'mp4v'),fps,(w,h))
-    if not writer.isOpened():raise RuntimeError('Cannot open video writer')
+    writer=cv2.VideoWriter(str(partial),cv2.VideoWriter_fourcc(*'mp4v'),fps,(w,h)) if save_rgb else None
+    if writer is not None and not writer.isOpened():raise RuntimeError('Cannot open video writer')
     samples=[];sample_ids=set(np.linspace(0,n-1,min(9,n),dtype=int))
     try:
         for i in range(n):
@@ -198,8 +227,9 @@ def render_gpu(cfg,scene,doc,assets,save_depth=False):
             forward=rotation@np.array([0.,0.,1.]);up=rotation@np.array([0.,-1.,0.])
             up-=np.dot(up,forward)*forward;up/=np.linalg.norm(up)
             renderer.scene.camera.look_at(position+forward*10000.,position,up)
-            frame=np.asarray(renderer.render_to_image())
-            writer.write(cv2.cvtColor(frame,cv2.COLOR_RGB2BGR))
+            if save_rgb:
+                frame=np.asarray(renderer.render_to_image())
+                writer.write(cv2.cvtColor(frame,cv2.COLOR_RGB2BGR))
             if save_depth:
                 depth=np.asarray(renderer.render_to_depth_image(z_in_view_space=True),np.float32)
                 valid=np.isfinite(depth)&(depth>0)&(depth<99999.)
@@ -212,14 +242,16 @@ def render_gpu(cfg,scene,doc,assets,save_depth=False):
                 if not cv2.imwrite(str(tmp),encoded,[cv2.IMWRITE_PNG_COMPRESSION,3]):
                     raise IOError(f'Failed to save {tmp}')
                 tmp.replace(target)
-            if i in sample_ids:samples.append(cv2.resize(frame,(320,180)))
+            if save_rgb and i in sample_ids:samples.append(cv2.resize(frame,(320,180)))
             if (i+1)%200==0 or i+1==n:print(f'GPU render: {i+1}/{n}',flush=True)
-        writer.release();check_video(partial,n,cfg)
+        if writer is not None:
+            writer.release();check_video(partial,n,cfg)
     except Exception:
-        writer.release();partial.unlink(missing_ok=True);raise
-    partial.replace(video)
+        if writer is not None:writer.release();partial.unlink(missing_ok=True)
+        raise
+    if save_rgb:partial.replace(video)
     meta_path=scene/'meta.json';output_meta=json.loads(meta_path.read_text())
-    output_meta['renderer']='open3d_gpu'
+    if save_rgb:output_meta['renderer']='open3d_gpu'
     if save_depth:
         scale=float(cfg.get('depth',{}).get('scale_m_per_unit',.01))
         depth_meta={'frames':n,'width':w,'height':h,'format':'PNG','dtype':'uint16',
@@ -228,8 +260,9 @@ def render_gpu(cfg,scene,doc,assets,save_depth=False):
         atomic_json(depth_dir/'metadata.json',depth_meta);check_depth(scene,n,cfg)
         output_meta['depth']={'directory':'depth','file_pattern':'depth_%06d.png',**depth_meta}
     atomic_json(meta_path,output_meta)
-    rows=[np.hstack(samples[j:j+3]) for j in range(0,len(samples),3)]
-    cv2.imwrite(str(scene/'preview'/'camera_view_samples.jpg'),np.vstack(rows))
+    if samples:
+        rows=[np.hstack(samples[j:j+3]) for j in range(0,len(samples),3)]
+        cv2.imwrite(str(scene/'preview'/'camera_view_samples.jpg'),np.vstack(rows))
     compact_output(scene)
 
 
@@ -241,7 +274,7 @@ def load_config(path, frames=None):
     return cfg
 
 
-def run(cfg, command, save_depth=False):
+def run(cfg, command, save_depth=False, save_rgb=True):
     frames=cfg['sequence']['frames'];scene=Path(cfg['map']['tile_dir'])
     if command=='validate':
         cfg=json.loads((scene/'config_used.json').read_text())
@@ -267,18 +300,26 @@ def run(cfg, command, save_depth=False):
     if command=='plan':
         print(f'Planned {frames} manual-route frames: {scene}')
         return
-    render_gpu(cfg,scene,doc,assets,save_depth)
+    if command=='preview':
+        path=render_first_frame_gpu(cfg,scene,doc,assets)
+        print(f'First-frame RGB preview: {path}')
+        return
+    render_gpu(cfg,scene,doc,assets,save_depth,save_rgb)
     print(f'Complete: {scene}')
 
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('command',choices=['plan','generate','validate','plan-all','generate-all','validate-all'])
+    parser.add_argument('command',choices=['plan','preview','generate','validate','plan-all','generate-all','validate-all'])
     parser.add_argument('--config',type=Path)
     parser.add_argument('--root',type=Path,default=Path('/mnt/Data/RIght/MovingDrone_Tiles'))
     parser.add_argument('--frames',type=int)
     parser.add_argument('--depth',action='store_true',help='Save 16-bit metric camera-Z depth PNGs')
+    parser.add_argument('--no-rgb',dest='save_rgb',action='store_false',default=True,
+                        help='Skip RGB video output and render only auxiliary outputs such as depth')
     args=parser.parse_args()
+    if args.command.startswith('generate') and not args.depth and not args.save_rgb:
+        parser.error('Select RGB and/or --depth')
     if args.command.endswith('-all'):
         action=args.command[:-4]
         configs=[]
@@ -291,7 +332,7 @@ def main():
             try:
                 cfg=load_config(path,args.frames)
                 print(f'[{i}/{len(configs)}] {path.parent.parent.name}/{path.parent.name}',flush=True)
-                run(cfg,action,args.depth)
+                run(cfg,action,args.depth,args.save_rgb)
             except Exception as error:
                 failures.append((path,str(error)))
                 print(f'FAILED {path}: {error}',flush=True)
@@ -299,7 +340,7 @@ def main():
             raise RuntimeError(f'{len(failures)}/{len(configs)} tiles failed: '+', '.join(p.parent.name for p,_ in failures))
         return
     if args.config is None: parser.error('--config is required unless using an *-all command')
-    run(load_config(args.config,args.frames),args.command,args.depth)
+    run(load_config(args.config,args.frames),args.command,args.depth,args.save_rgb)
 
 
 if __name__=='__main__':

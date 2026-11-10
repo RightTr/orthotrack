@@ -19,21 +19,43 @@ button:disabled{opacity:.5}button.primary{background:#1769aa;color:white}
 <label>Selected tile <select id="tile"><option value="">Choose a tile</option></select></label>
 <label>Height AGL (m) <input id="height" type="number" step="1"></label>
 <label>Tilt from nadir (°) <input id="tilt" type="number" min="20" max="30" step="0.5"></label>
-<button id="undo">Undo stroke</button><button id="save" class="primary">Save route</button></div>
-<div id="info"></div><div id="legend"><b style="color:#d98b00">Yellow: hand-drawn route</b><b style="color:#008da8">Blue: smoothed route used for rendering</b></div><div id="status"></div>
+<label>Frames <input id="frames" type="number" min="2" max="20000" step="1"></label>
+<label>Camera aim (Flight path 0 ↔ Tile center 1) <input id="aim" type="range" min="0" max="1" step="0.05"><span id="aimLabel"></span></label>
+<button id="undo">Undo stroke</button><button id="save" class="primary">Save route</button><button id="planPreview">Plan + Preview first RGB</button></div>
+<div id="info"></div><div id="legend"><b style="color:#d98b00">Yellow: hand-drawn route</b><b style="color:#008da8">Blue: smoothed route</b><b style="color:#ed4b00">Orange arrows: camera forward direction</b></div><div id="status"></div>
 <div id="stage"><img id="map"><canvas id="draw"></canvas></div>
 <div id="dopPreview" hidden><h2>UAV DOP view</h2><div id="viewStatus">Draw a route to preview the final camera-view crop.</div><img id="viewImage" style="display:block;max-width:100%;height:auto;margin-top:8px"></div>
-<p>Drag to select an area on the full reference DOP. Confirm the crop, then draw a 2D route on the tile. Release the mouse to preview the smoothed route, then save it. Reference altitude and camera depression angle are retained.</p>
+<div id="heightPreview" hidden><h2>Trajectory height vs full mesh</h2><div id="heightStatus">Draw a route to compare its altitude with the mesh.</div><img id="heightImage" style="display:block;max-width:100%;height:auto;margin-top:8px"></div>
+<div id="firstFramePreview" hidden><h2>Planned first RGB frame</h2><div id="firstFrameStatus"></div><img id="firstFrameImage" style="display:block;max-width:100%;height:auto;margin-top:8px"></div>
+<p>Orange arrows show the camera's horizontal forward direction along the smoothed route. Height controls altitude above ground; tilt controls how far forward the camera looks from nadir.</p>
 </section>
-<section id="generatePanel" hidden><h2>Generate data</h2><p>Choose a tile with a saved route to generate its RGB video and metric depth maps.</p>
-<div class="controls"><label>Saved tile <select id="generateTile"><option value="">Choose a tile</option></select></label><button id="generate" class="primary" disabled>Generate RGB + depth</button></div>
+<section id="generatePanel" hidden><h2>Generate data</h2><p>Choose a saved tile and select which outputs to render.</p>
+<div class="controls"><label>Saved tile <select id="generateTile"><option value="">Choose a tile</option></select></label>
+<label><input id="renderRGB" type="checkbox" checked> RGB video</label><label><input id="renderDepth" type="checkbox" checked> Depth maps</label>
+<button id="generate" class="primary" disabled>Generate selected outputs</button></div>
 <div id="generateStatus"></div></section>
 </main><script>
 const $=id=>document.getElementById(id),canvas=$('draw'),ctx=canvas.getContext('2d'),map=$('map');
-let scenes=[],tiles=[],source=null,currentTile=null,mode='crop',rect=null,start=null,dragging=false,points=[],smoothPoints=[],smoothMetrics=null,history=[],previewId=0,viewPreviewId=0,routeSaved=false;
+let scenes=[],tiles=[],source=null,currentTile=null,mode='crop',rect=null,start=null,dragging=false,points=[],smoothPoints=[],smoothMetrics=null,history=[],previewId=0,viewPreviewId=0,heightPreviewId=0,routeSaved=false;
 function note(s){$('status').textContent=s}
 function dist(a,b){return Math.hypot(a[0]-b[0],a[1]-b[1])}
 function pos(e){const r=canvas.getBoundingClientRect();return [(e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height]}
+function drawCameraArrows(){
+ if(!currentTile||smoothPoints.length<2)return;
+ const [x0,y0,x1,y1]=currentTile.bounds_local,cx=canvas.width/2,cy=canvas.height/2;
+ const wx=canvas.width/(x1-x0),wy=canvas.height/(y1-y0),arc=[0];
+ for(let i=1;i<smoothPoints.length;i++)arc.push(arc.at(-1)+Math.hypot((smoothPoints[i][0]-smoothPoints[i-1][0])/wx,(smoothPoints[i][1]-smoothPoints[i-1][1])/wy));
+ const step=Math.max(1,Math.floor(smoothPoints.length/12)),look=currentTile.heading_lookahead_m||35,weight=Number($('aim').value);
+ ctx.save();ctx.strokeStyle='#ed4b00';ctx.fillStyle='#ed4b00';ctx.lineWidth=3;
+ for(let i=Math.floor(smoothPoints.length/14);i<smoothPoints.length-1;i+=step){
+  const p=smoothPoints[i],j=arc.findIndex((d,k)=>k>i&&d>=arc[i]+look),q=smoothPoints[j<0?smoothPoints.length-1:j];
+  let dx=(q[0]-p[0])/wx,dy=-(q[1]-p[1])/wy,n=Math.hypot(dx,dy);if(n<1e-5)continue;dx/=n;dy/=n;
+  let tx=(cx-p[0])/wx,ty=-(cy-p[1])/wy,tn=Math.hypot(tx,ty);if(tn>1e-5){tx/=tn;ty/=tn;dx=(1-weight)*dx+weight*tx;dy=(1-weight)*dy+weight*ty;n=Math.hypot(dx,dy);if(n>1e-5){dx/=n;dy/=n}}
+  const ex=p[0]+dx*38,ey=p[1]-dy*38,a=Math.atan2(ey-p[1],ex-p[0]);
+  ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(ex,ey);ctx.stroke();ctx.beginPath();ctx.moveTo(ex,ey);ctx.lineTo(ex-10*Math.cos(a-.5),ey-10*Math.sin(a-.5));ctx.lineTo(ex-10*Math.cos(a+.5),ey-10*Math.sin(a+.5));ctx.closePath();ctx.fill();
+ }
+ ctx.restore();
+}
 function draw(){
  ctx.clearRect(0,0,canvas.width,canvas.height);
  $('legend').style.display=mode==='route'?'block':'none';
@@ -45,44 +67,54 @@ function draw(){
   const line=(path,color,width,dash=[])=>{if(path.length<2)return;ctx.beginPath();ctx.moveTo(...path[0]);for(let i=1;i<path.length;i++)ctx.lineTo(...path[i]);ctx.setLineDash(dash);ctx.lineWidth=width;ctx.strokeStyle=color;ctx.stroke();ctx.setLineDash([])};
   line(points,'#17202a',8);line(points,'#ffca28',3,[8,5]);
   line(smoothPoints,'#17202a',9);line(smoothPoints,'#00c9e8',5);
+  drawCameraArrows();
   for(const [p,c] of [[points[0],'#20c65a'],[points.at(-1),'#e53935']]){ctx.beginPath();ctx.arc(p[0],p[1],7,0,2*Math.PI);ctx.fillStyle=c;ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='#17202a';ctx.stroke()}}
 }
 async function requestSmooth(){
  if(mode!=='route'||!currentTile||points.length<4)return;
  const id=++previewId,p=points.map(([x,y])=>[x/canvas.width,y/canvas.height]);note('Computing smoothed route…');
- try{const r=await fetch('/route-preview/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p})}),d=await r.json();
+ try{const r=await fetch('/route-preview/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p,frames:Number($('frames').value)})}),d=await r.json();
   if(!r.ok)throw Error(d.error||'Server returned '+r.status);if(id!==previewId)return;
   smoothPoints=d.points_pixel_xy;smoothMetrics=d.metrics;draw();const m=smoothMetrics;
-  note((m.feasible?'Smoothed preview':'Preview exceeds current limits')+' · smoothing '+m.smoothing_m+' m · max speed '+m.max_speed_mps.toFixed(1)+' m/s · max turn '+m.max_turn_rate_deg_s.toFixed(1)+'°/s');
+  note((m.feasible?'Route preview':'Route exceeds limits')+' · '+m.frames+' frames · '+m.max_speed_mps.toFixed(1)+' m/s · turn '+m.max_turn_rate_deg_s.toFixed(1)+'°/s');
  }catch(error){if(id===previewId)note('Smoothing preview failed: '+error.message)}
 }
 async function requestDopView(){
  if(mode!=='route'||!currentTile||points.length<4)return;
  const id=++viewPreviewId,p=points.map(([x,y])=>[x/canvas.width,y/canvas.height]);
  $('viewStatus').textContent='Updating DOP view…';
- try{const r=await fetch('/dop-view/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p,height_agl_m:Number($('height').value),tilt_from_nadir_deg:Number($('tilt').value)})});
+ try{const r=await fetch('/dop-view/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p,height_agl_m:Number($('height').value),tilt_from_nadir_deg:Number($('tilt').value),camera_center_weight:Number($('aim').value),frames:Number($('frames').value)})});
   if(!r.ok){const d=await r.json();throw Error(d.error||'Preview failed')}const blob=await r.blob();if(id!==viewPreviewId)return;
   if($('viewImage').dataset.url)URL.revokeObjectURL($('viewImage').dataset.url);const url=URL.createObjectURL(blob);$('viewImage').src=url;$('viewImage').dataset.url=url;
   $('viewStatus').textContent='DOP coverage: '+Math.round(Number(r.headers.get('X-DOP-Coverage'))*100)+'% · Height '+$('height').value+' m AGL · Tilt '+$('tilt').value+'° from nadir';
  }catch(error){if(id===viewPreviewId)$('viewStatus').textContent='DOP preview failed: '+error.message}
 }
+async function requestHeightView(){
+ if(mode!=='route'||!currentTile||points.length<4)return;
+ const id=++heightPreviewId,p=points.map(([x,y])=>[x/canvas.width,y/canvas.height]);$('heightStatus').textContent='Building mesh height view…';
+ try{const r=await fetch('/height-view/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p,height_agl_m:Number($('height').value),frames:Number($('frames').value)})});
+  if(!r.ok){const d=await r.json();throw Error(d.error||'Height view failed')}const blob=await r.blob();if(id!==heightPreviewId)return;
+  if($('heightImage').dataset.url)URL.revokeObjectURL($('heightImage').dataset.url);const url=URL.createObjectURL(blob);$('heightImage').src=url;$('heightImage').dataset.url=url;$('heightStatus').textContent='Mesh height and UAV altitude are shown in local meters.';
+ }catch(error){if(id===heightPreviewId)$('heightStatus').textContent='Height view failed: '+error.message}
+}
+function updateCameraPreview(){requestDopView();requestHeightView()}
 function setImage(url){map.onload=()=>{canvas.width=map.naturalWidth;canvas.height=map.naturalHeight;draw()};map.src=url}
 canvas.onpointerdown=e=>{const p=pos(e);if(mode==='crop'){start=p;rect=null;dragging=true;canvas.setPointerCapture(e.pointerId);draw();return}
  if(!currentTile){note('Confirm a DOP crop first');return}if(points.length&&dist(p,points.at(-1))>35){note('Continue near the endpoint, or clear and redraw');return}
- smoothPoints=[];smoothMetrics=null;routeSaved=false;
+ smoothPoints=[];smoothMetrics=null;routeSaved=false;$('firstFramePreview').hidden=true;
  history.push(points.length);dragging=true;canvas.setPointerCapture(e.pointerId);if(!points.length||dist(p,points.at(-1))>2)points.push(p);draw()};
 canvas.onpointermove=e=>{if(!dragging)return;const p=pos(e);if(mode==='crop'){rect=[Math.min(start[0],p[0]),Math.min(start[1],p[1]),Math.max(start[0],p[0]),Math.max(start[1],p[1])];draw();return}if(dist(p,points.at(-1))>=2){points.push(p);draw()}};
-for(const e of ['pointerup','pointercancel'])canvas.addEventListener(e,()=>{const changed=dragging;dragging=false;if(changed&&mode==='route'){requestSmooth();requestDopView()}});
- $('clear').onclick=()=>{if(mode==='crop'){rect=null;$('accept').disabled=true;draw();note('Crop selection cleared. Drag to select an area.')}else{points=[];smoothPoints=[];smoothMetrics=null;history=[];previewId++;viewPreviewId++;routeSaved=false;$('viewImage').removeAttribute('src');$('viewStatus').textContent='Draw a route to preview its DOP view.';draw();note('Route cleared')}};
-$('undo').onclick=()=>{if(mode==='route'&&history.length){points=points.slice(0,history.pop());smoothPoints=[];routeSaved=false;draw();requestSmooth();requestDopView()}};
+for(const e of ['pointerup','pointercancel'])canvas.addEventListener(e,()=>{const changed=dragging;dragging=false;if(changed&&mode==='route'){requestSmooth();updateCameraPreview()}});
+ $('clear').onclick=()=>{if(mode==='crop'){rect=null;$('accept').disabled=true;draw();note('Crop selection cleared. Drag to select an area.')}else{points=[];smoothPoints=[];smoothMetrics=null;history=[];previewId++;viewPreviewId++;heightPreviewId++;routeSaved=false;$('firstFramePreview').hidden=true;$('viewImage').removeAttribute('src');$('heightImage').removeAttribute('src');$('viewStatus').textContent='Draw a route to preview its DOP view.';$('heightStatus').textContent='Draw a route to compare its altitude with the mesh.';draw();note('Route cleared')}};
+$('undo').onclick=()=>{if(mode==='route'&&history.length){points=points.slice(0,history.pop());smoothPoints=[];routeSaved=false;draw();requestSmooth();updateCameraPreview()}};
 async function refreshTiles(){tiles=await(await fetch('/api/tiles')).json();const keep=$('tile').value;$('tile').replaceChildren(new Option('Choose a tile',''));
  for(const t of tiles.filter(t=>t.scene===$('scene').value))$('tile').add(new Option(t.name+(t.saved?' ✓':''),t.name));if(tiles.some(t=>t.name===keep))$('tile').value=keep;
  const gen=$('generateTile'),selected=gen.value;gen.replaceChildren(new Option('Choose a tile',''));
  for(const t of tiles.filter(t=>t.saved))gen.add(new Option(t.name+(t.generated?' · generated':''),t.name));
  if(tiles.some(t=>t.name===selected&&t.saved))gen.value=selected;updateGenerateButton()}
-function updateGenerateButton(){const t=tiles.find(t=>t.name===$('generateTile').value);$('generate').disabled=!t||!t.saved}
-async function loadSource(s){mode='crop';currentTile=null;points=[];rect=null;history=[];routeSaved=false;$('dopPreview').hidden=true;$('accept').disabled=true;source=await(await fetch('/api/source/'+encodeURIComponent(s))).json();setImage('/source-image/'+encodeURIComponent(s));note('Drag on the full reference DOP to select a crop')}
-async function chooseTile(n){const t=tiles.find(t=>t.name===n);if(!t)return;currentTile=t;mode='route';rect=null;points=[];smoothPoints=[];smoothMetrics=null;history=[];routeSaved=false;previewId++;viewPreviewId++;$('dopPreview').hidden=false;$('tile').value=n;$('height').min=t.agl_min_m;$('height').max=t.agl_max_m;$('height').value=t.height_agl_m;$('tilt').value=t.tilt_deg;source={width:t.width,height:t.height,agl:[t.agl_min_m,t.agl_m,t.agl_max_m],tilt:t.tilt_deg};$('accept').disabled=true;setImage('/dop/'+encodeURIComponent(n));const r=await fetch('/route/'+encodeURIComponent(n));if(r.ok){const saved=await r.json();points=saved.points_pixel_xy||[];smoothPoints=saved.points_smoothed_pixel_xy||[];smoothMetrics=saved.smooth_preview||null;routeSaved=true}draw();if(smoothPoints.length){const m=smoothMetrics;note(m?'Loaded smoothed preview · '+m.smoothing_m+' m · turn '+m.max_turn_rate_deg_s.toFixed(1)+'°/s':'Loaded hand-drawn route');requestDopView()}else{note('Draw a 2D route on the cropped DOP');requestSmooth()}}
+function updateGenerateButton(){const t=tiles.find(t=>t.name===$('generateTile').value);$('generate').disabled=!t||!t.saved||(!$('renderRGB').checked&&!$('renderDepth').checked)}
+async function loadSource(s){mode='crop';currentTile=null;points=[];rect=null;history=[];routeSaved=false;$('dopPreview').hidden=true;$('heightPreview').hidden=true;$('firstFramePreview').hidden=true;$('accept').disabled=true;source=await(await fetch('/api/source/'+encodeURIComponent(s))).json();setImage('/source-image/'+encodeURIComponent(s));note('Drag on the full reference DOP to select a crop')}
+async function chooseTile(n){const t=tiles.find(t=>t.name===n);if(!t)return;currentTile=t;mode='route';rect=null;points=[];smoothPoints=[];smoothMetrics=null;history=[];routeSaved=false;previewId++;viewPreviewId++;heightPreviewId++;$('firstFramePreview').hidden=true;$('dopPreview').hidden=false;$('heightPreview').hidden=false;$('tile').value=n;$('height').min=t.agl_min_m;$('height').max=t.agl_max_m;$('height').value=t.height_agl_m;$('tilt').value=t.tilt_deg;$('frames').value=t.frames;$('aim').value=t.camera_center_weight;$('aimLabel').textContent=Number(t.camera_center_weight).toFixed(2);source={width:t.width,height:t.height,agl:[t.agl_min_m,t.agl_m,t.agl_max_m],tilt:t.tilt_deg};$('accept').disabled=true;setImage('/dop/'+encodeURIComponent(n));const r=await fetch('/route/'+encodeURIComponent(n));if(r.ok){const saved=await r.json();points=saved.points_pixel_xy||[];smoothPoints=saved.points_smoothed_pixel_xy||[];smoothMetrics=saved.smooth_preview||null;routeSaved=true}draw();if(smoothPoints.length){note('Loaded saved route · '+t.frames+' frames');requestSmooth();updateCameraPreview()}else{note('Draw a 2D route on the cropped DOP');requestSmooth()}}
 $('scene').onchange=async()=>{await refreshTiles();$('tile').value='';loadSource($('scene').value)};
 $('tile').onchange=e=>{if(e.target.value)chooseTile(e.target.value)};
 $('back').onclick=()=>loadSource($('scene').value);
@@ -91,14 +123,19 @@ $('accept').onclick=async()=>{if(mode!=='crop'||!rect)return;const r=[rect[0]/ca
  try{const response=await fetch('/api/accept',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scene:$('scene').value,rect:r})}),data=await response.json();
   if(!response.ok)throw Error(data.error||'Server returned '+response.status);cropSaved=true;await refreshTiles();await chooseTile(data.name);note('Crop saved: '+data.name)
  }catch(error){note((cropSaved?'Crop saved, but tile refresh failed: ':'Crop failed: ')+error.message);button.disabled=false}};
- $('save').onclick=async()=>{if(mode!=='route'||!currentTile||points.length<4){note('Confirm a crop and draw a route first');return}
- const p=points.map(([x,y])=>[x/canvas.width,y/canvas.height]),r=await fetch('/route/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p,height_agl_m:Number($('height').value),tilt_from_nadir_deg:Number($('tilt').value)})}),d=await r.json();if(!r.ok){note('Save failed: '+d.error);return}smoothPoints=d.points_pixel_xy;smoothMetrics=d.metrics;routeSaved=true;note((d.metrics.feasible?'Saved':'Saved, but speed/turn limits are exceeded')+' · '+d.smooth_points+' smoothed points · '+d.saved+' · max turn '+d.metrics.max_turn_rate_deg_s.toFixed(1)+'°/s');draw();refreshTiles()};
-$('height').onchange=requestDopView;$('tilt').onchange=requestDopView;
+async function saveCurrentRoute(){if(mode!=='route'||!currentTile||points.length<4){note('Confirm a crop and draw a route first');return false}
+ const p=points.map(([x,y])=>[x/canvas.width,y/canvas.height]),r=await fetch('/route/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:p,height_agl_m:Number($('height').value),tilt_from_nadir_deg:Number($('tilt').value),camera_center_weight:Number($('aim').value),frames:Number($('frames').value)})}),d=await r.json();if(!r.ok){note('Save failed: '+d.error);return false}smoothPoints=d.points_pixel_xy;smoothMetrics=d.metrics;routeSaved=true;note((d.metrics.feasible?'Saved':'Saved; adjust the frame count to meet speed/turn limits')+' · '+d.frames+' frames · '+d.metrics.max_speed_mps.toFixed(1)+' m/s · '+d.saved);draw();refreshTiles();return true}
+$('save').onclick=saveCurrentRoute;
+$('planPreview').onclick=async()=>{if(!routeSaved&&!await saveCurrentRoute())return;const button=$('planPreview');button.disabled=true;$('firstFramePreview').hidden=false;$('firstFrameStatus').textContent='Planning route and rendering the first RGB frame on GPU…';
+ try{const r=await fetch('/plan-preview/'+encodeURIComponent(currentTile.name),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),d=await r.json();if(!r.ok)throw Error(d.error||'Plan preview failed');$('firstFrameImage').src='/preview-image/'+encodeURIComponent(currentTile.name)+'?t='+Date.now();$('firstFrameStatus').textContent='Plan passed · '+$('frames').value+' frames · '+d.scene}
+ catch(error){$('firstFrameStatus').textContent='Planning/preview failed: '+error.message}finally{button.disabled=false}};
+$('height').oninput=()=>{routeSaved=false;$('firstFramePreview').hidden=true;draw()};$('tilt').oninput=()=>{routeSaved=false;$('firstFramePreview').hidden=true;draw()};$('frames').oninput=()=>{routeSaved=false;$('firstFramePreview').hidden=true;draw()};$('aim').oninput=()=>{$('aimLabel').textContent=Number($('aim').value).toFixed(2);routeSaved=false;$('firstFramePreview').hidden=true;draw()};$('height').onchange=updateCameraPreview;$('tilt').onchange=requestDopView;$('aim').onchange=requestDopView;$('frames').onchange=requestSmooth;
  $('drawTab').onclick=()=>{$('drawPanel').hidden=false;$('generatePanel').hidden=true;$('drawTab').classList.add('primary');$('generateTab').classList.remove('primary')};
  $('generateTab').onclick=()=>{$('drawPanel').hidden=true;$('generatePanel').hidden=false;$('generateTab').classList.add('primary');$('drawTab').classList.remove('primary');refreshTiles()};
  $('generateTile').onchange=updateGenerateButton;
- $('generate').onclick=async()=>{const name=$('generateTile').value;if(!name)return;const b=$('generate');b.disabled=true;$('generateStatus').textContent='Planning and GPU rendering RGB + depth…';
- try{const r=await fetch('/generate/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),d=await r.json();if(!r.ok)throw Error(d.error||'Generation failed');$('generateStatus').textContent='Generation complete · '+d.scene+' · '+d.log.split('\n').slice(-2).join(' · ');await refreshTiles()}
+ $('renderRGB').onchange=updateGenerateButton;$('renderDepth').onchange=updateGenerateButton;
+ $('generate').onclick=async()=>{const name=$('generateTile').value;if(!name)return;const rgb=$('renderRGB').checked,depth=$('renderDepth').checked,b=$('generate');b.disabled=true;$('generateStatus').textContent='Planning and GPU rendering '+[rgb?'RGB':null,depth?'depth':null].filter(Boolean).join(' + ')+'…';
+ try{const r=await fetch('/generate/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rgb,depth})}),d=await r.json();if(!r.ok)throw Error(d.error||'Generation failed');$('generateStatus').textContent='Generation complete · '+d.scene+' · '+d.log.split('\n').slice(-2).join(' · ');await refreshTiles()}
  catch(error){$('generateStatus').textContent='Generation failed: '+error.message}finally{updateGenerateButton()}};
 (async()=>{scenes=await(await fetch('/api/scenes')).json();for(const s of scenes)$('scene').add(new Option(s,s));$('scene').value=scenes.includes('airport10')?'airport10':scenes[0];await refreshTiles();loadSource($('scene').value)})();
 </script></body></html>
