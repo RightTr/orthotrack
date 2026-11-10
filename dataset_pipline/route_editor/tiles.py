@@ -9,8 +9,6 @@ import yaml
 from dataset_pipline.loader import SceneLoader
 
 ROOT=Path(__file__).resolve().parents[2]
-DATA=Path('/mnt/Data/RIght/MovingDrone_Ref')
-OUT=DATA
 
 
 def save_json(path,value):
@@ -20,14 +18,14 @@ def save_json(path,value):
     tmp.replace(path)
 
 
-def scene_names(ref_path=DATA):
+def scene_names(ref_path):
     ref_path=Path(ref_path)
     if (ref_path/'meta.json').is_file():return [ref_path.name]
     return sorted(p.name for p in ref_path.iterdir() if (p/'meta.json').is_file())
 
 
 @lru_cache(maxsize=6)
-def source_info(scene,ref_path=DATA):
+def source_info(scene,ref_path):
     ref_path=Path(ref_path)
     ref=ref_path if (ref_path/'meta.json').is_file() else ref_path/scene
     if not (ref/'meta.json').is_file():raise ValueError(f'Unknown scene: {scene}')
@@ -43,7 +41,7 @@ def source_info(scene,ref_path=DATA):
             'fov':camera['median_fov_vertical_deg']}
 
 
-def crop_candidate(scene,rect,ref_path=DATA):
+def crop_candidate(scene,rect,ref_path):
     info=source_info(scene,Path(ref_path));image=info['image'];h,w=image.shape[:2]
     r=np.asarray(rect,float)
     if r.shape!=(4,) or not np.isfinite(r).all() or np.any(r<0) or np.any(r>1):
@@ -64,7 +62,7 @@ def crop_candidate(scene,rect,ref_path=DATA):
             'source_dop':str(info['image_path'])}
 
 
-def accept_candidate(candidate,root=OUT,ref_path=DATA):
+def accept_candidate(candidate,root,ref_path):
     scene=candidate['scene'];root=Path(root);scene_dir=root if root.name==scene else root/scene;index=1
     while (scene_dir/f'tile{index:02d}').exists():index+=1
     tile_id=f'tile{index:02d}';name=f'{scene}_{tile_id}'

@@ -15,7 +15,7 @@ import yaml
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
-from dataset_pipline.route_editor.tiles import DATA,OUT,accept_candidate,crop_candidate,scene_names,source_info
+from dataset_pipline.route_editor.tiles import accept_candidate,crop_candidate,scene_names,source_info
 from dataset_pipline.loader import SceneLoader
 from dataset_pipline.planner import preview_route
 from dataset_pipline.trajectory import make_forward_poses,plan_altitude
@@ -153,14 +153,14 @@ def height_view_preview(tile,points,height,frames):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--ref-path',type=Path,default=DATA,
-                        help='MovingDrone_Ref root or one scene directory')
-    parser.add_argument('--save-path',type=Path,default=OUT,
-                        help='Sequence root or one sequence directory; creates tileXX inside the matching sequence')
+    parser.add_argument('--ref-path',type=Path,required=True,
+                        help='Reference scene root or one scene directory')
+    parser.add_argument('--save-path',type=Path,
+                        help='Tile output root or one scene directory')
     parser.add_argument('--host',default='127.0.0.1')
     parser.add_argument('--port',type=int,default=8765)
     args=parser.parse_args()
-    args.ref_path=args.ref_path.resolve();args.save_path=args.save_path.resolve()
+    args.ref_path=args.ref_path.resolve();args.save_path=(args.save_path or args.ref_path).resolve()
     lock=Lock()
     render_lock=Lock()
     height_lock=Lock()
