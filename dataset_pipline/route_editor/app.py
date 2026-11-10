@@ -1,6 +1,7 @@
-"""Browser UI for rerolling DOP crops and drawing routes on accepted tiles."""
+"""Browser UI for drawing routes and generating saved DOP tiles."""
 import argparse
 import json
+import subprocess
 import sys
 import traceback
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
@@ -17,6 +18,9 @@ sys.path.insert(0,str(ROOT))
 from dataset_pipline.route_editor.tiles import DATA,OUT,accept_candidate,crop_candidate,scene_names,source_info
 from dataset_pipline.loader import SceneLoader
 from dataset_pipline.planner import preview_route
+from dataset_pipline.trajectory import make_forward_poses,plan_altitude
+from dataset_pipline.collision import dsm_heights
+from dataset_pipline.utils import crop_dop,frustum_hits
 
 PAGE=Path(__file__).with_name('index.html')
 
@@ -36,12 +40,61 @@ def tile_catalog(root,ref_path):
                        'width':cfg['map']['crop_width_px'],'height':cfg['map']['crop_height_px'],
                        'bounds_local':dop['bounds'],'utm_offset':meta['utm_offset'],
                        'image':image,'route':Path(cfg['trajectory']['manual_route_file']),
+                       'config':path,
                        'agl_min_m':cfg['trajectory']['reference_agl_min_m'],
                        'agl_m':cfg['trajectory']['reference_agl_m'],
+                       'height_agl_m':cfg['trajectory']['height_agl_m'],
                        'agl_max_m':cfg['trajectory']['reference_agl_max_m'],
                        'tilt_deg':cfg['trajectory']['tilt_from_nadir_deg'],
                        'sequence':cfg['sequence'],'trajectory':cfg['trajectory']}
     return catalog
+
+
+def dop_view_preview(tile,points,height,tilt):
+    cfg=yaml.safe_load(tile['config'].read_text())
+    plan=cfg['trajectory'];height=float(height);tilt=float(tilt)
+    if not plan['reference_agl_min_m']<=height<=plan['reference_agl_max_m']:
+        raise ValueError('Height must stay within the reference AGL range')
+    if not 20<=tilt<=30:raise ValueError('Camera tilt must be between 20° and 30° from nadir')
+    x0,y0,x1,y1=tile['bounds_local']
+    local_xy=np.column_stack((x0+points[:,0]*(x1-x0),y1-points[:,1]*(y1-y0)))
+    offset=np.asarray(tile['utm_offset'],float);world_xy=local_xy+offset[:2]
+    world_bounds=np.asarray(tile['bounds_local'],float)+np.tile(offset[:2],2)
+    route=preview_route(world_xy,world_bounds,cfg['sequence']['frames'],cfg['sequence']['fps'],plan)
+    loader=SceneLoader(cfg['map']['reference_scene'],load_mesh=False)
+    dsm,dsm_bounds=loader.dsm();dsm_bounds=np.asarray(dsm_bounds,float)
+    terrain=float(np.nanmedian(dsm[dsm>-9000]))+offset[2]+cfg['map']['vertical_offset_m']
+    positions=np.column_stack((route['xy'],np.full(len(route['xy']),terrain+height)))
+    local=positions-offset
+    roof=dsm_heights(dsm,dsm_bounds,local[:,:2])
+    local[:,2]=plan_altitude(roof,height+cfg['map']['vertical_offset_m'],
+        plan['safe_distance_m'],plan['max_vertical_speed_mps'],cfg['sequence']['fps'])
+    plan['look_at_center_xy']=((world_bounds[:2]+world_bounds[2:])/2-offset[:2]).tolist()
+    plan['look_at_z']=float(np.nanmedian(roof)+cfg['map']['vertical_offset_m'])
+    plan['camera_tilt_lock_deg']=tilt
+    rotations=make_forward_poses(local,cfg)
+    hits=frustum_hits(local,rotations,float(np.nanmedian(roof)),cfg,dsm,dsm_bounds)
+    ground_hits=hits[np.isfinite(hits[:,:,0])]
+    if not len(ground_hits):raise ValueError('Camera view does not intersect the ground')
+    crop=np.asarray(tile['bounds_local'],float);center=(crop[:2]+crop[2:])/2
+    half=(crop[2:]-crop[:2])*plan.get('max_view_crop_scale',5.)/2
+    bounds=np.r_[np.minimum(ground_hits.min(0),local[:,:2].min(0))-10,
+                 np.maximum(ground_hits.max(0),local[:,:2].max(0))+10]
+    full_dop,full_image=loader.dop(cfg['map']['dop_year'],render=True)
+    texture=np.asarray(full_dop['bounds'],float)
+    bounds[:2]=np.maximum(np.maximum(bounds[:2],center-half),texture[:2])
+    bounds[2:]=np.minimum(np.minimum(bounds[2:],center+half),texture[2:])
+    view,actual=crop_dop(full_image,texture,bounds)
+    for xy in route['xy']:
+        px=int((xy[0]-actual[0])/(actual[2]-actual[0])*view.shape[1])
+        py=int((actual[3]-xy[1])/(actual[3]-actual[1])*view.shape[0])
+        if 0<=px<view.shape[1] and 0<=py<view.shape[0]:cv2.circle(view,(px,py),2,(0,255,255),-1)
+    overlap=((hits[:,:,0]>=crop[0])&(hits[:,:,0]<=crop[2])&
+             (hits[:,:,1]>=crop[1])&(hits[:,:,1]<=crop[3]))
+    valid=np.isfinite(hits[:,:,0]);coverage=float(overlap[valid].mean())
+    ok,encoded=cv2.imencode('.jpg',view,[cv2.IMWRITE_JPEG_QUALITY,88])
+    if not ok:raise ValueError('Cannot encode DOP view preview')
+    return encoded.tobytes(),coverage,actual
 
 
 def main():
@@ -55,6 +108,7 @@ def main():
     args=parser.parse_args()
     args.ref_path=args.ref_path.resolve();args.save_path=args.save_path.resolve()
     lock=Lock()
+    render_lock=Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self,status,data,content_type='application/json'):
@@ -88,8 +142,11 @@ def main():
                 if not ok:raise ValueError('Cannot encode reference DOP preview')
                 return self.reply(200,encoded.tobytes(),'image/jpeg')
             if path=='/api/tiles':
-                return self.reply(200,[{k:v for k,v in tile.items() if k not in ('image','route','utm_offset','bounds_local','sequence','trajectory')}
-                                       |{'saved':tile['route'].is_file()} for tile in tile_catalog(args.save_path,args.ref_path).values()])
+                return self.reply(200,[{k:v for k,v in tile.items() if k not in ('image','route','utm_offset','bounds_local','sequence','trajectory','config')}
+                                       |{'saved':tile['route'].is_file(),
+                                         'generated':all((tile['config'].parent/path).exists()
+                                                         for path in ('video.mp4','poses.csv','depth/metadata.json'))}
+                                       for tile in tile_catalog(args.save_path,args.ref_path).values()])
             kind,_,name=path.lstrip('/').partition('/')
             tile=tile_catalog(args.save_path,args.ref_path).get(name)
             if tile is None:return self.reply(404,{'error':'Unknown DOP tile'})
@@ -110,6 +167,29 @@ def main():
                     return self.reply(200,{'name':name,'config':str(config_path)})
                 kind,_,name=path.lstrip('/').partition('/')
                 tile=tile_catalog(args.save_path,args.ref_path).get(name)
+                if kind=='dop-view' and tile is not None:
+                    points=np.asarray(submitted['points'],float)
+                    if points.ndim!=2 or points.shape[1]!=2 or len(points)<4 or not np.isfinite(points).all():
+                        raise ValueError('Draw a route first to preview its DOP view')
+                    image,coverage,bounds=dop_view_preview(tile,points,submitted['height_agl_m'],
+                                                            submitted['tilt_from_nadir_deg'])
+                    self.send_response(200);self.send_header('Content-Type','image/jpeg')
+                    self.send_header('Content-Length',str(len(image)))
+                    self.send_header('X-DOP-Coverage',f'{coverage:.3f}')
+                    self.send_header('X-DOP-Bounds',','.join(f'{v:.1f}' for v in bounds))
+                    self.end_headers();self.wfile.write(image);return
+                if kind=='generate' and tile is not None:
+                    if not tile['route'].is_file():raise ValueError('Save a route before generating')
+                    if not render_lock.acquire(blocking=False):return self.reply(409,{'error':'A render is already running'})
+                    try:
+                        result=subprocess.run([sys.executable,str(ROOT/'dataset_pipline/pipeline.py'),
+                                               'generate','--config',str(tile['config']),'--depth'],
+                                              cwd=ROOT,capture_output=True,text=True)
+                    finally:
+                        render_lock.release()
+                    log=(result.stdout+'\n'+result.stderr).strip()[-3000:]
+                    if result.returncode:return self.reply(500,{'error':log})
+                    return self.reply(200,{'log':log,'scene':str(tile['config'].parent)})
                 if kind not in ('route','route-preview') or tile is None:return self.reply(404,{'error':'Unknown DOP tile'})
                 points=np.asarray(submitted['points'],float)
                 if points.ndim!=2 or points.shape[1]!=2 or not 4<=len(points)<=20000:
@@ -125,6 +205,11 @@ def main():
                 world_bounds=np.asarray(tile['bounds_local'],float)+np.tile(np.asarray(tile['utm_offset'][:2]),2)
                 result=preview_route(world,world_bounds,tile['sequence']['frames'],tile['sequence']['fps'],
                                      tile['trajectory'])
+                height=float(submitted.get('height_agl_m',tile['agl_m']))
+                tilt=float(submitted.get('tilt_from_nadir_deg',tile['tilt_deg']))
+                if not tile['agl_min_m']<=height<=tile['agl_max_m']:
+                    raise ValueError('Height must stay within the reference AGL range')
+                if not 20<=tilt<=30:raise ValueError('Camera tilt must be between 20° and 30° from nadir')
                 smooth_local=result['smooth']-np.asarray(tile['utm_offset'][:2])
                 smooth_norm=np.column_stack(((smooth_local[:,0]-x0)/(x1-x0),
                                              (y1-smooth_local[:,1])/(y1-y0)))
@@ -136,7 +221,7 @@ def main():
                        'image_size_px':[tile['width'],tile['height']],
                        'dop_bounds_local':tile['bounds_local'],'utm_offset':tile['utm_offset'],
                        'reference_agl_m':[tile['agl_min_m'],tile['agl_m'],tile['agl_max_m']],
-                       'reference_tilt_from_nadir_deg':tile['tilt_deg'],
+                       'reference_tilt_from_nadir_deg':tilt,
                        'points_normalized':points.tolist(),'points_pixel_xy':pixel.tolist(),
                        'points_local_xy_m':local.tolist(),'points_world_xy_m':world.tolist(),
                        'points_smoothed_normalized':smooth_norm.tolist(),
@@ -145,6 +230,11 @@ def main():
                        'smoothing_m':result['smoothing_m'],'smooth_preview':metrics}
                 target=tile['route'];target.parent.mkdir(parents=True,exist_ok=True)
                 tmp=target.with_suffix('.json.tmp');tmp.write_text(json.dumps(route,indent=2));tmp.replace(target)
+                cfg=yaml.safe_load(tile['config'].read_text())
+                cfg['trajectory']['height_agl_m']=height
+                cfg['trajectory']['tilt_from_nadir_deg']=tilt
+                temp=tile['config'].with_suffix('.yaml.tmp')
+                temp.write_text(yaml.safe_dump(cfg,sort_keys=False));temp.replace(tile['config'])
                 state_path=args.save_path/'selected_tiles.json'
                 if state_path.is_file():
                     with lock:

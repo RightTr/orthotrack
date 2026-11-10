@@ -14,7 +14,7 @@ This pipeline turns a manually selected DOP area and a hand-drawn 2D route into 
 python dataset_pipline/route_editor/app.py --host 0.0.0.0 --port 8765
 ```
 
-The defaults use `MovingDrone_Ref` for both reference and save roots. The editor reads scene folders from that root and saves each tile inside the matching scene directory, without duplicating the scene name: `MovingDrone_Ref/airport10/tile01/`, then `tile02/`, and so on. Open [http://localhost:8765](http://localhost:8765), select a scene, drag on the full reference DOP to choose a crop, and click **Confirm crop**. Select the new tile, draw a route, review the smoothed blue preview, and click **Save route**.
+The defaults use `MovingDrone_Ref` for both reference and save roots. The editor reads scene folders from that root and saves each tile inside the matching scene directory, without duplicating the scene name: `MovingDrone_Ref/airport10/tile01/`, then `tile02/`, and so on. Open [http://localhost:8765](http://localhost:8765). Use **1. Draw route** to select a scene, crop the DOP, draw a route, and review the smoothed blue preview. Set **Height AGL** and **Tilt from nadir** to preview the resulting **UAV DOP view**. The height is constrained to the reference AGL range and tilt to 20°–30°. Click **Save route** to store the route and camera settings. Use **2. Generate data** to choose any tile with a saved route and run GPU rendering for its RGB video and depth maps.
 
 To work with one scene and set both paths explicitly:
 
