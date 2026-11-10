@@ -1,13 +1,9 @@
-"""Deterministic metric trajectories and GES-compatible pose export."""
+"""Manual-route camera orientations and GES-compatible pose export."""
 import json
 from pathlib import Path
 import numpy as np
 from pyproj import Transformer
 from scipy.spatial.transform import Rotation
-
-
-def make_poses(positions, cfg):
-    return make_forward_poses(positions, cfg)
 
 
 def make_forward_poses(positions, cfg):
@@ -22,18 +18,32 @@ def make_forward_poses(positions, cfg):
     terminal=np.linalg.norm(direction,axis=1)<1e-8
     direction[terminal]=positions[terminal,:2]-back[terminal]
     heading=np.unwrap(np.arctan2(direction[:,1],direction[:,0]))
-    side=np.deg2rad(plan['side_look_deg'])*np.sin(2*np.pi*arc/max(arc[-1],1))
-    heading+=side
-    fov=float(cfg['sequence']['fov_vertical_deg'])
-    max_tilt=90-fov/2-1
-    tilt=plan['tilt_from_nadir_deg']+plan['tilt_variation_deg']*np.sin(2*np.pi*arc/max(arc[-1],1))
-    if np.any(tilt<=0) or np.any(tilt>=max_tilt):
-        raise ValueError(f'Camera tilt must be between 0 and {max_tilt:.1f} degrees for this FOV')
-    tilt=np.deg2rad(tilt)
-    forward=np.column_stack((np.cos(heading)*np.sin(tilt),np.sin(heading)*np.sin(tilt),-np.cos(tilt)))
+    direction=np.column_stack((np.cos(heading),np.sin(heading)))
+    center=np.asarray(plan['look_at_center_xy'],float)
+    toward_center=center-positions[:,:2]
+    toward_center/=np.maximum(np.linalg.norm(toward_center,axis=1,keepdims=True),1e-9)
+    weight=float(plan.get('camera_center_weight',.5))
+    direction=(1-weight)*direction+weight*toward_center
+    direction/=np.maximum(np.linalg.norm(direction,axis=1,keepdims=True),1e-9)
+    vertical=positions[:,2]-float(plan['look_at_z'])
+    if np.any(vertical<=0): raise ValueError('Camera must stay above its look-at surface')
+    angle=np.deg2rad(float(plan['camera_tilt_lock_deg']))
+    horizontal=direction*(np.tan(angle)*vertical)[:,None]
+    forward=np.column_stack((horizontal,-vertical))
+    forward/=np.maximum(np.linalg.norm(forward,axis=1)[:,None],1e-9)
     right=np.cross(forward,[0.,0.,1.]);right/=np.linalg.norm(right,axis=1)[:,None]
     down=np.cross(forward,right)
     return np.stack((right,down,forward),axis=2)
+
+
+def plan_altitude(ground, agl, clearance, max_vertical_speed, fps):
+    altitude=np.maximum(ground+agl,ground+clearance)
+    step=max_vertical_speed/fps
+    for i in range(len(altitude)-2,-1,-1):
+        altitude[i]=max(altitude[i],altitude[i+1]-step)
+    for i in range(1,len(altitude)):
+        altitude[i]=max(altitude[i],altitude[i-1]-step)
+    return altitude
 
 
 def export_ges(path, positions, rotations, cfg):

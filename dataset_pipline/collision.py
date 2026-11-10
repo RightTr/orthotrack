@@ -11,9 +11,8 @@ def dsm_heights(dsm, bounds, xy):
     return (1-dx)*(1-dy)*dsm[r,c]+dx*(1-dy)*dsm[r,c+1]+(1-dx)*dy*dsm[r+1,c]+dx*dy*dsm[r+1,c+1]
 
 
-def validate(points, dsm, bounds, mesh_path, clearance=3., step=.5):
+def validate(points, dsm, bounds, vertices, faces, clearance=3., step=.5):
     """Returns minimum clearance; fails closed on missing/invalid geometry."""
-    import open3d as o3d
     pieces=[]; owners=[]
     for i in range(len(points)-1):
         count=max(2,int(np.ceil(np.linalg.norm(points[i+1]-points[i])/step))+1)
@@ -25,7 +24,11 @@ def validate(points, dsm, bounds, mesh_path, clearance=3., step=.5):
     if not valid.all(): raise ValueError(f'DSM void near frame {int(owners[~valid][0])}')
     gap=samples[:,2]-surface
     if gap.min()<=clearance: raise ValueError(f'DSM clearance at frame {int(owners[gap.argmin()])}: {gap.min():.2f} m')
-    data=np.load(mesh_path); vertices=data['vertices'].astype('float32'); faces=data['faces'].astype('uint32')
+    mesh_top=float(vertices[:,2].max())
+    if points[:,2].min()>mesh_top+clearance:
+        return {'min_clearance_m':float(min(gap.min(),points[:,2].min()-mesh_top)),
+                'collision_count':0,'invalid_frames':[],'adjusted_segments':[]}
+    import open3d as o3d
     scene=o3d.t.geometry.RaycastingScene(); scene.add_triangles(o3d.core.Tensor(vertices),o3d.core.Tensor(faces))
     minimum=float('inf')
     for start in range(0,len(samples),100000):
